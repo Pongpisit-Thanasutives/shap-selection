@@ -1,6 +1,8 @@
-# shap_selection
+# shap-selection
 
-Feature selection for linear models using SHAP values, based on:
+**Version 0.3.0**
+
+Feature selection for machine learning models using SHAP values, based on:
 
 > Marcilio-Jr & Eler, *"From explanations to feature selection: assessing SHAP values as feature selection mechanism"*, SIBGRAPI 2020.
 
@@ -8,134 +10,68 @@ Feature selection for linear models using SHAP values, based on:
 
 ## Installation
 
+Clone the repository and install locally:
+
 ```bash
-pip install shap scikit-learn numpy
+git clone https://github.com/your-username/shap-selection.git
+cd shap-selection
+pip install .
 ```
+
+For knee detection support, also install the optional dependency:
+
+```bash
+pip install ".[knee]"
+# or separately:
+pip install kneeliverse
+```
+
+**Dependencies** (installed automatically): `numpy >= 1.21`, `shap >= 0.42`, `scikit-learn >= 1.0`
 
 ---
 
-## Regression example
+## How it works
 
-The full workflow in four steps: fit, rank, select, retrain.
+Features are ranked by their mean absolute SHAP value. A performance curve is then built by retraining the model on increasing subsets of features (top-1, top-2, ... or top-10%, top-20%, ...) and scoring each with cross-validation. Two strategies are provided to automatically select the optimal subset from this curve:
+
+- **`select_by_keep_absolute`** — picks the smallest subset whose CV score is within one standard deviation of the peak (*1-std rule*).
+- **`select_by_knee_detection`** — finds the point of diminishing returns on the curve using one of five algorithms from [Kneeliverse](https://github.com/mariolpantunes/knee). Uses per-feature stepping by default for maximum resolution.
+
+---
+
+## Quick start
 
 ```python
-import numpy as np
-from sklearn.datasets import fetch_california_housing
 from sklearn.linear_model import LinearRegression
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_squared_error
-
 from shap_selection import shap_select, select_by_keep_absolute, apply_feature_selection
 
-# 1. Load and prepare data
-data = fetch_california_housing()
-X, y = data.data, data.target
-feature_names = list(data.feature_names)
-
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-
-scaler = StandardScaler()
-X_train = scaler.fit_transform(X_train)
-X_test  = scaler.transform(X_test)
-
-# 2. Fit a linear model and rank features by SHAP importance
-#    LinearExplainer is selected automatically — no extra flags needed
-model = LinearRegression()
+# 1. Fit and rank
+model = LinearRegression(fit_intercept=False)
 model.fit(X_train, y_train)
 
 ordered_names, importance_values = shap_select(
     model, X_train, feature_names, task='regression'
 )
 
-print("Feature ranking:")
-for name, score in zip(ordered_names, importance_values):
-    print(f"  {name:<20} {score:.4f}")
-# Feature ranking:
-#   MedInc               8.2103
-#   Latitude             3.1872
-#   Longitude            2.9341
-#   HouseAge             1.0234
-#   AveOccup             0.8812
-#   AveRooms             0.5023
-#   Population           0.2341
-#   AveBedrms            0.1987
-
-# 3. Select the most parsimonious feature subset using the Keep Absolute metric.
-#    The sweep retrains at each subset size (10%→100%) with CV, then picks the
-#    smallest subset whose score is within one CV std of the peak.
+# 2. Select
 results = select_by_keep_absolute(
-    lambda: LinearRegression(),
-    X_train, y_train,
-    feature_names, ordered_names,
+    lambda: LinearRegression(fit_intercept=False),
+    X_train, y_train, feature_names, ordered_names,
     task='regression',
-    cv=5,
 )
+print(results['selected_features'])  # ['feat_a', 'feat_b', ...]
 
-print(f"\nSelected {len(results['selected_features'])} of {len(feature_names)} features:")
-print(f"  {results['selected_features']}")
-print(f"  (fraction: {results['selected_fraction']} — peak was at {results['best_fraction']})")
-# Selected 4 of 8 features:
-#   ['MedInc', 'Latitude', 'Longitude', 'HouseAge']
-#   (fraction: 0.4 — peak was at 1.0)
-
-# 4. Retrain the final model on the selected features only
-X_train_final = apply_feature_selection(X_train, feature_names, results['selected_features'])
-X_test_final  = apply_feature_selection(X_test,  feature_names, results['selected_features'])
-
-final_model = LinearRegression()
-final_model.fit(X_train_final, y_train)
-
-mse_full     = mean_squared_error(y_test, model.predict(X_test))
-mse_selected = mean_squared_error(y_test, final_model.predict(X_test_final))
-print(f"\nMSE — full model ({len(feature_names)} features): {mse_full:.4f}")
-print(f"MSE — selected  ({len(results['selected_features'])} features): {mse_selected:.4f}")
-# MSE — full model (8 features): 0.5561
-# MSE — selected  (4 features):  0.5712
+# 3. Retrain on selected features
+X_final = apply_feature_selection(X_train, feature_names, results['selected_features'])
+final_model = LinearRegression(fit_intercept=False)
+final_model.fit(X_final, y_train)
 ```
 
 ---
 
-## How `select_by_keep_absolute` works
+## Knee detection
 
-It implements the **Keep Absolute** metric from the paper (Fig. 3). For each
-subset size from 10% to 100%, the model is retrained with only the top-d
-SHAP-ranked features, then scored with cross-validation using R² (default).
-The selected subset is the **smallest** fraction whose mean CV score is within
-one standard deviation of the peak — favouring parsimony without sacrificing
-meaningful performance.
-
-R² is used as the default scorer for regression because it is positive,
-bounded (0–1 for a reasonable model), and directly interpretable. The AUC
-is therefore also positive and easy to compare across feature subsets.
-
----
-
-## API reference
-
-| Function | Description |
-|---|---|
-| `shap_select` | Rank features by SHAP importance (auto-selects Linear / Tree / Kernel explainer) |
-| `select_by_keep_absolute` | Sweep subset sizes and return the most parsimonious feature set (1-std rule) |
-| `select_by_knee_detection` | Sweep subset sizes and return the feature set at the point of diminishing returns |
-| `keep_absolute` | Run the Keep Absolute sweep and return the full score curve and AUC |
-| `shap_threshold_select` | Select features by fixed importance threshold or top-k count |
-| `apply_feature_selection` | Filter a dataset to the selected feature columns |
-| `KNEE_METHODS` | List of available knee detection method names |
-
----
-
-## Knee detection methods
-
-`select_by_knee_detection` supports five algorithms from [Kneeliverse](https://github.com/mariolpantunes/knee) via the `method=` argument:
-
-| Method | Algorithm | Best for |
-|---|---|---|
-| `'kneedle'` (default) | Kneedle (Satopaa et al., 2011) — normalized difference signal | General use; handles multi-knee curves |
-| `'dfdt'` | Dynamic First Derivative Thresholding — gradient threshold | Curves with a clear gradient change |
-| `'curvature'` | Discrete curvature — maximum local curvature | Smooth curves |
-| `'menger'` | Menger curvature — circumradius of point triplets | Smooth curves, alternative to curvature |
-| `'lmethod'` | L-method — two-segment linear fit intersection | Piecewise-linear curves |
+`select_by_knee_detection` defaults to `step_by='feature'`, which evaluates every feature count from 1 to n individually. This gives the knee algorithm full resolution — important when features are correlated or polynomial, where coarser fraction-based stepping can skip the true elbow.
 
 ```python
 from shap_selection import select_by_knee_detection, KNEE_METHODS
@@ -143,32 +79,57 @@ from shap_selection import select_by_knee_detection, KNEE_METHODS
 print(KNEE_METHODS)
 # ['kneedle', 'dfdt', 'curvature', 'menger', 'lmethod']
 
-# Default (kneedle)
 results = select_by_knee_detection(
     lambda: LinearRegression(fit_intercept=False),
     X_train, y_train, feature_names, ordered_names,
     task='regression',
+    method='kneedle',   # default
+    step_by='feature',  # default: one CV fit per feature count
 )
 
-# Use a different algorithm
-results = select_by_knee_detection(
-    lambda: LinearRegression(fit_intercept=False),
-    X_train, y_train, feature_names, ordered_names,
-    task='regression',
-    method='lmethod',
-)
-
-print(results['method'])           # 'lmethod'
-print(results['knee_fraction'])    # e.g. 0.4
 print(results['selected_features'])
+print(results['knee_fraction'])   # e.g. 0.14 (7 of 49 features)
+print(results['curve_shape'])     # 'concave' or 'convex' (auto-detected)
 ```
 
-Install kneeliverse to use knee detection:
-```bash
-pip install kneeliverse
-# or, using the package extra:
-pip install shap-selection[knee]
-```
+### Curve shape auto-detection
+
+The library automatically infers whether the score curve is **concave** (diminishing returns — typical) or **convex** (accelerating gains — common with polynomial features). Knee algorithms are designed for concave curves; for convex curves the library bypasses the algorithm and returns the start of the final performance plateau directly. The detected shape is available in `results['curve_shape']` and `results['curve_direction']`.
+
+### Available methods
+
+| `method=` | Algorithm | Best for |
+|---|---|---|
+| `'kneedle'` (default) | Kneedle (Satopaa et al., 2011) | General use; handles multi-knee curves |
+| `'dfdt'` | Dynamic First Derivative Thresholding | Curves with a clear gradient change |
+| `'curvature'` | Discrete curvature | Smooth curves |
+| `'menger'` | Menger curvature | Smooth curves, alternative estimator |
+| `'lmethod'` | L-method (two-segment linear fit) | Piecewise-linear curves |
+
+### `step_by` parameter
+
+Both selection functions accept `step_by`:
+
+| `step_by=` | Steps | CV fits (n=49 features) |
+|---|---|---|
+| `'fraction'` | 10%, 20%, ..., 100% | 10 |
+| `'feature'` | 1, 2, ..., n features | 49 |
+
+`select_by_knee_detection` defaults to `'feature'`; `select_by_keep_absolute` defaults to `'fraction'` (the paper's original setting). You can pass `steps=` explicitly to override both.
+
+---
+
+## API reference
+
+| Function / Constant | Description |
+|---|---|
+| `shap_select` | Rank features by SHAP importance (auto-selects Linear / Tree / Kernel explainer) |
+| `select_by_keep_absolute` | 1-std rule: smallest subset within noise of the CV peak |
+| `select_by_knee_detection` | Knee detection: point of diminishing returns on the score curve |
+| `keep_absolute` | Run the full sweep and return the score curve and AUC |
+| `shap_threshold_select` | Select by fixed importance threshold or top-k count |
+| `apply_feature_selection` | Filter a dataset to the selected feature columns |
+| `KNEE_METHODS` | List of available knee detection method names |
 
 ---
 
@@ -197,11 +158,11 @@ If you use this library in your research, please cite both the original paper an
   title   = {shap-selection: Feature selection via SHAP values},
   year    = {2025},
   url     = {https://github.com/your-username/shap-selection},
-  version = {0.2.0}
+  version = {0.3.0}
 }
 ```
 
-The Kneedle algorithm used in `select_by_knee_detection` is one of several algorithms from [Kneeliverse](https://github.com/mariolpantunes/knee):
+**Kneeliverse** (for `select_by_knee_detection`):
 
 ```bibtex
 @article{antunes2025kneeliverse,
@@ -212,4 +173,3 @@ The Kneedle algorithm used in `select_by_knee_detection` is one of several algor
   doi     = {10.1016/j.softx.2025.102089}
 }
 ```
-

@@ -79,6 +79,8 @@ def _select_columns(X, all_names, keep_names):
     :param keep_names: ordered list of names to keep
     :return: numpy array (n_samples, len(keep_names))
     """
+    all_names = list(all_names)
+    keep_names = list(keep_names)
     indices = [all_names.index(name) for name in keep_names]
     return np.array(X)[:, indices]
 
@@ -164,7 +166,8 @@ def shap_select(model, X_train, feature_names,
 # ---------------------------------------------------------------------------
 
 def keep_absolute(model_factory, X, y, feature_names, ordered_feature_names,
-                  task='classification', steps=None, cv=None, scoring=None):
+                  task='classification', steps=None, cv=None, scoring=None,
+                  step_by='fraction'):
     """
     Evaluate a SHAP feature ranking with the Keep Absolute metric.
 
@@ -181,12 +184,18 @@ def keep_absolute(model_factory, X, y, feature_names, ordered_feature_names,
                                   (first output of shap_select)
     :param task:                  'classification' or 'regression'
     :param steps:                 list of fractions in (0, 1] to evaluate;
+                                  ignored when step_by='feature';
                                   defaults to [0.1, 0.2, ..., 1.0]
     :param cv:                    number of cross-validation folds (default 3)
     :param scoring:               sklearn scorer string or callable.
                                   Defaults to 'f1_weighted' (classification)
                                   or 'r2' (regression). Use higher-is-better
                                   scorers so that AUC and peak detection work.
+    :param step_by:               'fraction' (default) evaluates at 10%, 20%,
+                                  ... 100% of features. 'feature' evaluates at
+                                  every individual feature count 1, 2, ..., n,
+                                  giving the knee detector full resolution.
+                                  Ignored if steps is provided explicitly.
     :return: dict with keys
              'fractions'  -- list of fractions evaluated
              'scores'     -- mean CV score at each fraction (numpy array)
@@ -207,7 +216,10 @@ def keep_absolute(model_factory, X, y, feature_names, ordered_feature_names,
         )
 
     if steps is None:
-        steps = [round(i / 10, 1) for i in range(1, 11)]
+        if step_by == 'feature':
+            steps = [i / n_features for i in range(1, n_features + 1)]
+        else:
+            steps = [round(i / 10, 1) for i in range(1, 11)]
     if cv is None:
         cv = 3
     if scoring is None:
@@ -249,7 +261,8 @@ def keep_absolute(model_factory, X, y, feature_names, ordered_feature_names,
 
 def select_by_keep_absolute(model_factory, X, y, feature_names,
                              ordered_feature_names, task='classification',
-                             steps=None, cv=None, scoring=None):
+                             steps=None, cv=None, scoring=None,
+                             step_by='fraction'):
     """
     Use the Keep Absolute metric to select the smallest feature subset that
     performs as well as the full model within the noise of cross-validation
@@ -269,9 +282,12 @@ def select_by_keep_absolute(model_factory, X, y, feature_names,
     :param feature_names:         list of all feature names
     :param ordered_feature_names: importance-ordered feature names (from shap_select)
     :param task:                  'classification' or 'regression'
-    :param steps:                 fractions to evaluate (default 0.1 .. 1.0)
+    :param steps:                 fractions to evaluate (default 0.1 .. 1.0);
+                                  ignored when step_by='feature'
     :param cv:                    CV folds (default 3)
     :param scoring:               sklearn scorer (default f1_weighted / r2)
+    :param step_by:               'fraction' (default) or 'feature' (one step
+                                  per feature, 1 .. n)
     :return: dict with all keep_absolute outputs plus:
              'best_fraction'     -- fraction at peak CV score
              'selected_fraction' -- smallest fraction within 1 CV std of peak
@@ -279,7 +295,8 @@ def select_by_keep_absolute(model_factory, X, y, feature_names,
     """
     ka = keep_absolute(model_factory, X, y, feature_names,
                        ordered_feature_names, task=task,
-                       steps=steps, cv=cv, scoring=scoring)
+                       steps=steps, cv=cv, scoring=scoring,
+                       step_by=step_by)
 
     scores = ka['scores']
     stds = ka['std']
@@ -316,7 +333,7 @@ def select_by_keep_absolute(model_factory, X, y, feature_names,
 #   knees(points: np.ndarray, p=PeakDetection) -> np.ndarray of indices
 _KNEE_REGISTRY = {
     'kneedle':   ('kneeliverse.kneedle',   'knee'),
-    'dfdt':      ('kneeliverse.dfdt',      'get_knee'),
+    'dfdt':      ('kneeliverse.dfdt',      'knee'),
     'curvature': ('kneeliverse.curvature', 'knee'),
     'menger':    ('kneeliverse.menger',    'knee'),
     'lmethod':   ('kneeliverse.lmethod',   'knee'),
@@ -479,7 +496,8 @@ def _run_knee_method(fractions, scores, method, **method_kwargs):
         if k not in ('curve', 'direction', 'p'):
             call_kwargs[k] = v
 
-    idx = fn(x, y, **call_kwargs) if call_kwargs else fn(x, y)
+    points = np.column_stack([x, y])
+    idx = fn(points, **call_kwargs) if call_kwargs else fn(points)
 
     if idx is None:
         return None
@@ -492,7 +510,8 @@ def _run_knee_method(fractions, scores, method, **method_kwargs):
 def select_by_knee_detection(model_factory, X, y, feature_names,
                               ordered_feature_names, task='classification',
                               steps=None, cv=None, scoring=None,
-                              method='kneedle', **method_kwargs):
+                              method='kneedle', step_by='feature',
+                              **method_kwargs):
     """
     Use the Keep Absolute metric and a knee-detection algorithm to find the
     point of diminishing returns on the score-vs-feature-fraction curve.
@@ -551,10 +570,14 @@ def select_by_knee_detection(model_factory, X, y, feature_names,
     :param feature_names:         list of all feature names
     :param ordered_feature_names: importance-ordered feature names (from shap_select)
     :param task:                  'classification' or 'regression'
-    :param steps:                 fractions to evaluate (default 0.1 .. 1.0)
+    :param steps:                 fractions to evaluate; ignored when
+                                  step_by='feature' (the default for knee detection)
     :param cv:                    CV folds (default 3)
     :param scoring:               sklearn scorer (default f1_weighted / r2)
     :param method:                knee detection algorithm (default 'kneedle')
+    :param step_by:               'feature' (default) evaluates at every individual
+                                  feature count 1, 2, ..., n for full resolution.
+                                  'fraction' uses 10%, 20%, ... 100% steps instead.
     :param method_kwargs:         extra kwargs forwarded to the kneeliverse call
     :return: dict with all keep_absolute outputs plus:
              'knee_fraction'     -- fraction at the detected knee
@@ -571,7 +594,8 @@ def select_by_knee_detection(model_factory, X, y, feature_names,
 
     ka = keep_absolute(model_factory, X, y, feature_names,
                        ordered_feature_names, task=task,
-                       steps=steps, cv=cv, scoring=scoring)
+                       steps=steps, cv=cv, scoring=scoring,
+                       step_by=step_by)
 
     fractions = np.array(ka['fractions'])
     scores = np.array(ka['scores'])
@@ -607,6 +631,169 @@ def select_by_knee_detection(model_factory, X, y, feature_names,
     ka['curve_shape'] = curve_shape       # 'concave' or 'convex'
     ka['curve_direction'] = curve_direction  # 'increasing' or 'decreasing'
     return ka
+
+
+# ---------------------------------------------------------------------------
+# Information-criterion selection (BIC / AIC)
+# ---------------------------------------------------------------------------
+
+def _compute_criterion(model_factory, X, y, feature_names, selected_features, task, criterion):
+    """
+    Fit a fresh model on the selected features and compute BIC or AIC.
+
+    BIC = k·ln(n) - 2·ln(L̂)
+    AIC = 2k        - 2·ln(L̂)
+
+    For regression the log-likelihood is derived from the RSS assuming
+    Gaussian errors:  ln(L̂) = -n/2 · ln(2π·RSS/n) - n/2
+
+    For classification we use log-loss:  ln(L̂) = -n · log_loss(y, p̂)
+
+    k = number of free parameters = number of selected features
+        (+ 1 for the intercept if the model has one, + 1 for σ² in regression)
+
+    :param model_factory:     callable that returns an unfitted model
+    :param X:                 (n, p) full feature array
+    :param y:                 target vector
+    :param feature_names:     all feature names (matching columns of X)
+    :param selected_features: subset of feature names to evaluate
+    :param task:              'classification' or 'regression'
+    :param criterion:         'bic' or 'aic'
+    :return: (score, log_likelihood, k, n)  — lower score is better
+    """
+    from sklearn.model_selection import cross_val_predict
+    from sklearn.metrics import log_loss
+
+    n = len(y)
+    X_sel = _select_columns(X, feature_names, selected_features)
+    k = len(selected_features)
+
+    model = model_factory()
+
+    # Count intercept as a free parameter if the model exposes fit_intercept
+    has_intercept = getattr(model, 'fit_intercept', False)
+    if has_intercept:
+        k += 1
+
+    model.fit(X_sel, y)
+
+    if task == 'regression':
+        y_pred = model.predict(X_sel)
+        rss = float(np.sum((y - y_pred) ** 2))
+        if rss <= 0:
+            rss = 1e-10
+        # MLE variance estimate
+        sigma2 = rss / n
+        # Gaussian log-likelihood
+        log_lik = -n / 2.0 * np.log(2 * np.pi * sigma2) - n / 2.0
+        k += 1  # +1 for σ²
+    else:
+        proba = model.predict_proba(X_sel)
+        ll = -log_loss(y, proba, normalize=False)  # sum, not mean
+        log_lik = float(ll)
+
+    if criterion == 'bic':
+        score = k * np.log(n) - 2.0 * log_lik
+    else:  # aic
+        score = 2.0 * k - 2.0 * log_lik
+
+    return score, log_lik, k, n
+
+
+def auto_select(
+    model_factory,
+    X, y,
+    feature_names,
+    ordered_feature_names,
+    task='classification',
+    steps=None,
+    cv=3,
+    scoring=None,
+    criterion='bic',
+    knee_method='kneedle',
+    step_by_absolute='fraction',
+    step_by_knee='feature',
+    **knee_kwargs,
+):
+    """
+    Run both ``select_by_keep_absolute`` (1-std rule) and
+    ``select_by_knee_detection`` on the same SHAP-ordered features, then
+    choose the candidate subset with the lower BIC (or AIC).
+
+    The information criterion penalises model complexity, so it naturally
+    prefers the more parsimonious subset when both methods give similar
+    predictive performance.
+
+    :param model_factory:         callable → unfitted model
+    :param X:                     (n, p) feature array
+    :param y:                     target vector
+    :param feature_names:         all feature names in X
+    :param ordered_feature_names: SHAP-ordered feature names (most → least important)
+    :param task:                  'classification' or 'regression'
+    :param steps:                 fraction steps for keep_absolute sweep (default: auto)
+    :param cv:                    cross-validation folds (default 3)
+    :param scoring:               sklearn scoring string (default: task-appropriate)
+    :param criterion:             'bic' (default) or 'aic'
+    :param knee_method:           kneeliverse method for knee detection (default 'kneedle')
+    :param step_by_absolute:      step granularity for keep_absolute ('fraction' or 'feature')
+    :param step_by_knee:          step granularity for knee detection ('feature' or 'fraction')
+    :param knee_kwargs:           extra kwargs forwarded to select_by_knee_detection
+    :return: dict with keys:
+        - ``selected_features``     winning feature list
+        - ``winner``                'absolute' or 'knee'
+        - ``criterion``             'bic' or 'aic'
+        - ``absolute_features``     features from keep_absolute
+        - ``knee_features``         features from knee detection
+        - ``absolute_criterion``    criterion score for keep_absolute subset
+        - ``knee_criterion``        criterion score for knee detection subset
+        - ``absolute_result``       full result dict from select_by_keep_absolute
+        - ``knee_result``           full result dict from select_by_knee_detection
+    """
+    criterion = criterion.lower()
+    if criterion not in ('bic', 'aic'):
+        raise ValueError(f"criterion must be 'bic' or 'aic', got '{criterion}'")
+
+    # --- Run both selectors ---
+    abs_result = select_by_keep_absolute(
+        model_factory, X, y, feature_names, ordered_feature_names,
+        task=task, steps=steps, cv=cv, scoring=scoring,
+        step_by=step_by_absolute,
+    )
+    knee_result = select_by_knee_detection(
+        model_factory, X, y, feature_names, ordered_feature_names,
+        task=task, steps=steps, cv=cv, scoring=scoring,
+        method=knee_method, step_by=step_by_knee,
+        **knee_kwargs,
+    )
+
+    abs_features = list(abs_result['selected_features'])
+    knee_features = list(knee_result['selected_features'])
+
+    # --- Score each candidate subset ---
+    abs_score, _, abs_k, _ = _compute_criterion(
+        model_factory, X, y, feature_names, abs_features, task, criterion
+    )
+    knee_score, _, knee_k, _ = _compute_criterion(
+        model_factory, X, y, feature_names, knee_features, task, criterion
+    )
+
+    # Lower criterion score is better
+    if abs_score <= knee_score:
+        winner = 'absolute'
+    else:
+        winner = 'knee'
+
+    return {
+        'selected_features':  abs_result['selected_features'] if winner == 'absolute' else knee_result['selected_features'],
+        'winner':             winner,
+        'criterion':          criterion,
+        'absolute_features':  np.array(abs_features),
+        'knee_features':      np.array(knee_features),
+        'absolute_criterion': abs_score,
+        'knee_criterion':     knee_score,
+        'absolute_result':    abs_result,
+        'knee_result':        knee_result,
+    }
 
 
 # ---------------------------------------------------------------------------
