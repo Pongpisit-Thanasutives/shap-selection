@@ -31,6 +31,9 @@ import warnings
 import numpy as np
 import shap
 
+# NumPy compatibility: trapezoid was added in 2.0, trapz removed in 2.0
+_trapz = getattr(np, 'trapezoid', None) or getattr(np, 'trapz')
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -234,7 +237,7 @@ def keep_absolute(model_factory, X, y, feature_names, ordered_feature_names,
 
     mean_scores = np.array(mean_scores)
     std_scores = np.array(std_scores)
-    auc = float(np.trapz(mean_scores, x=steps))
+    auc = float(_trapz(mean_scores, x=steps))
 
     return {
         'fractions': steps,
@@ -323,24 +326,98 @@ _KNEE_REGISTRY = {
 KNEE_METHODS = list(_KNEE_REGISTRY.keys())
 
 
+def _deduplicate_curve(fractions, scores):
+    """
+    Remove duplicate score values, keeping the minimum fraction for each
+    unique score.
+
+    When polynomial or highly correlated features are used, many adjacent
+    feature subsets produce identical CV scores. Feeding a flat plateau to a
+    knee detector causes it to fail or return an arbitrary point within the
+    plateau. Collapsing each plateau to its leftmost (minimum-fraction) point
+    gives the algorithm the sharpest possible signal.
+
+    Example:
+        fractions = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+        scores    = [-6.85e-4, -6.85e-4, -6.85e-4, 4.43e-3, 4.43e-3,
+                      4.43e-3,  9.76e-1,  9.76e-1,  9.76e-1, 9.76e-1]
+        ->
+        fractions = [0.1, 0.4, 0.7]
+        scores    = [-6.85e-4, 4.43e-3, 9.76e-1]
+
+    :param fractions: 1-D array-like of feature fractions
+    :param scores:    1-D array-like of CV scores (same length)
+    :return: (unique_fractions, unique_scores) as numpy arrays
+    """
+    x = np.asarray(fractions, dtype=float)
+    y = np.asarray(scores, dtype=float)
+
+    score_range = y.max() - y.min()
+    atol = score_range * 1e-6 if score_range > 0 else 1e-12
+
+    keep = [0]
+    for i in range(1, len(y)):
+        if not np.isclose(y[i], y[keep[-1]], atol=atol, rtol=0):
+            keep.append(i)
+
+    return x[keep], y[keep]
+
+
+def _infer_curve_shape(x, y):
+    """
+    Infer whether a curve is concave or convex by comparing the area under
+    the actual curve to the area under the chord connecting its endpoints.
+
+    For an increasing curve:
+      - concave (diminishing returns): bows ABOVE the chord -> AUC > chord area
+      - convex  (accelerating gains):  bows BELOW the chord -> AUC < chord area
+
+    This matters for feature selection because polynomial/sparse feature sets
+    often produce convex-increasing curves (near-zero performance until a
+    critical set is reached, then a sharp jump to plateau). Knee detectors
+    must be told the correct shape or they pick the wrong inflection point.
+
+    :param x: deduplicated fractions (numpy array, ascending)
+    :param y: deduplicated scores (numpy array)
+    :return: (curve, direction) where curve in {'concave', 'convex'} and
+             direction in {'increasing', 'decreasing'}
+    """
+    direction = 'increasing' if y[-1] >= y[0] else 'decreasing'
+    chord_area = (y[0] + y[-1]) / 2.0 * (x[-1] - x[0])
+    curve_area = float(_trapz(y, x))
+
+    if direction == 'increasing':
+        curve = 'concave' if curve_area >= chord_area else 'convex'
+    else:
+        curve = 'concave' if curve_area <= chord_area else 'convex'
+
+    return curve, direction
+
+
 def _run_knee_method(fractions, scores, method, **method_kwargs):
     """
     Dispatch a kneeliverse knee-detection algorithm on the score curve.
 
+    Two preprocessing steps are applied before running the algorithm:
+      1. Deduplication: only the minimum fraction for each unique score is
+         kept (collapses plateaus caused by polynomial/correlated features).
+      2. Shape inference: the curve's concavity/convexity is detected
+         automatically by comparing its area to the chord area, and the
+         correct parameters are passed to the knee algorithm.
+
+    For a convex-increasing curve (score accelerates then plateaus) the
+    relevant knee is the *last* detected one — the start of the final
+    plateau — so the rightmost knee index is used.
+
     Returns the detected knee fraction as a float, or None if no knee found.
-
-    For kneedle, multi-knee detection is used by default (PeakDetection.All).
-    The last (rightmost) knee is returned, which represents the final
-    significant plateau transition before the curve fully flattens — the
-    most useful cut-point for feature selection.
-
-    All other methods return a single index directly.
 
     :param fractions: 1-D numpy array of feature fractions (x axis)
     :param scores:    1-D numpy array of CV scores (y axis)
     :param method:    one of KNEE_METHODS
-    :param method_kwargs: forwarded to the kneeliverse function
-    :return: float knee fraction, or None
+    :param method_kwargs: forwarded to the kneeliverse function;
+                          'curve' and 'direction' are set automatically
+                          unless explicitly overridden by the caller
+    :return: float knee fraction (from original fractions), or None
     """
     import importlib
 
@@ -359,28 +436,53 @@ def _run_knee_method(fractions, scores, method, **method_kwargs):
             "the 'kneeliverse' package. Install it with: pip install kneeliverse"
         )
 
-    x = np.asarray(fractions, dtype=float)
-    y = np.asarray(scores, dtype=float)
+    x, y = _deduplicate_curve(fractions, scores)
 
+    # A curve with fewer than 3 unique points has no meaningful curvature.
+    if len(x) < 3:
+        return None
+
+    curve, direction = _infer_curve_shape(x, y)
+
+    # For a convex-increasing curve the score accelerates and then plateaus.
+    # The feature fraction we want is the START of that final plateau — the
+    # last deduplicated point — because everything before it contributes
+    # negligible performance. Knee algorithms are designed for concave curves
+    # and would return the first inflection (wrong) on a convex curve.
+    if direction == 'increasing' and curve == 'convex':
+        return float(x[-1])
+
+    # Symmetric: convex-decreasing means the curve drops sharply early then
+    # levels off; the knee of interest is the start of the flat tail = x[-1].
+    if direction == 'decreasing' and curve == 'convex':
+        return float(x[-1])
+
+    # Concave curve: use the chosen knee algorithm normally.
     if method == 'kneedle':
-        # Use multi-knee detection by default; user can pass p=PeakDetection.Left
-        # etc. via method_kwargs to override.
         from kneeliverse.kneedle import PeakDetection
         p = method_kwargs.get('p', PeakDetection.All)
         points = np.column_stack([x, y])
         indices = mod.knees(points, p=p)
         if len(indices) == 0:
             return None
-        # Last knee = rightmost plateau transition
-        return float(x[indices[-1]])
+        return float(x[indices[0]])
 
-    # All other methods: single-knee, returns an index
     fn = getattr(mod, fn_name)
-    idx = fn(x, y)
+    call_kwargs = {}
+    import inspect
+    sig = inspect.signature(fn)
+    if 'curve' in sig.parameters:
+        call_kwargs['curve'] = method_kwargs.get('curve', curve)
+    if 'direction' in sig.parameters:
+        call_kwargs['direction'] = method_kwargs.get('direction', direction)
+    for k, v in method_kwargs.items():
+        if k not in ('curve', 'direction', 'p'):
+            call_kwargs[k] = v
+
+    idx = fn(x, y, **call_kwargs) if call_kwargs else fn(x, y)
 
     if idx is None:
         return None
-    # kneeliverse returns -1 or a negative value when no knee is found
     if isinstance(idx, (int, np.integer)) and idx < 0:
         return None
 
@@ -459,6 +561,8 @@ def select_by_knee_detection(model_factory, X, y, feature_names,
              'selected_fraction' -- same as knee_fraction (or fallback)
              'selected_features' -- list of selected feature names
              'method'            -- name of the method used
+             'curve_shape'       -- inferred curve shape: 'concave' or 'convex'
+             'curve_direction'   -- inferred direction: 'increasing' or 'decreasing'
     """
     if method not in _KNEE_REGISTRY:
         raise ValueError(
@@ -469,8 +573,8 @@ def select_by_knee_detection(model_factory, X, y, feature_names,
                        ordered_feature_names, task=task,
                        steps=steps, cv=cv, scoring=scoring)
 
-    fractions = ka['fractions']
-    scores = ka['scores']
+    fractions = np.array(ka['fractions'])
+    scores = np.array(ka['scores'])
     ordered_feature_names = list(ordered_feature_names)
 
     knee_frac = _run_knee_method(fractions, scores, method, **method_kwargs)
@@ -486,6 +590,13 @@ def select_by_knee_detection(model_factory, X, y, feature_names,
         )
         knee_frac = float(fractions[int(np.argmax(scores))])
 
+    # Expose the inferred shape so the user can inspect/verify it
+    x_dedup, y_dedup = _deduplicate_curve(fractions, scores)
+    curve_shape, curve_direction = (
+        _infer_curve_shape(x_dedup, y_dedup) if len(x_dedup) >= 3
+        else ('unknown', 'unknown')
+    )
+
     n_keep = max(1, int(np.ceil(knee_frac * len(ordered_feature_names))))
     selected_features = ordered_feature_names[:n_keep]
 
@@ -493,6 +604,8 @@ def select_by_knee_detection(model_factory, X, y, feature_names,
     ka['selected_fraction'] = knee_frac
     ka['selected_features'] = selected_features
     ka['method'] = method
+    ka['curve_shape'] = curve_shape       # 'concave' or 'convex'
+    ka['curve_direction'] = curve_direction  # 'increasing' or 'decreasing'
     return ka
 
 
