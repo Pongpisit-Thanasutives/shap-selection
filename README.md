@@ -516,6 +516,7 @@ If you use this library in research, please cite the original paper and this rep
 ```bibtex
 @software{shap_selection,
   title   = {shap-selection: Feature selection via SHAP values},
+  author  = {Thanasutives, Pongpisit},
   year    = {2025},
   url     = {https://github.com/your-username/shap-selection},
   version = {1.0.1}
