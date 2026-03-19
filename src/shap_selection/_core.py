@@ -91,10 +91,23 @@ _trapz = getattr(np, 'trapezoid', None) or getattr(np, 'trapz')
 
 def _shap_ordering(feature_names, shap_values, task='classification'):
     feature_names = np.array(feature_names)
-    if task == 'classification' and isinstance(shap_values, list):
-        aggregated = np.sum(np.mean(np.abs(shap_values), axis=1), axis=0)
+    # Modern SHAP (>=0.42) returns a 3D ndarray (n_samples, n_features, n_classes)
+    # for multiclass classification; older versions return a list of 2D arrays.
+    # Both forms need per-class mean-absolute values summed across classes.
+    arr = np.asarray(shap_values) if not isinstance(shap_values, list) \
+        else np.array(shap_values)
+    if task == 'classification' and arr.ndim == 3:
+        # arr is (n_samples, n_features, n_classes) for modern SHAP
+        # or (n_classes, n_samples, n_features) from np.array(list-of-2D)
+        if isinstance(shap_values, list):
+            # Legacy list: each element is (n_samples, n_features)
+            # np.array -> (n_classes, n_samples, n_features)
+            aggregated = np.sum(np.mean(np.abs(arr), axis=1), axis=0)
+        else:
+            # Modern 3D ndarray: (n_samples, n_features, n_classes)
+            aggregated = np.sum(np.mean(np.abs(arr), axis=0), axis=1)
     else:
-        aggregated = np.mean(np.abs(shap_values), axis=0)
+        aggregated = np.mean(np.abs(arr), axis=0)
     order = np.argsort(aggregated)[::-1]
     return feature_names[order], aggregated[order]
 
@@ -102,8 +115,9 @@ def _shap_ordering(feature_names, shap_values, task='classification'):
 def _select_columns(X, all_names, keep_names):
     all_names  = list(all_names)
     keep_names = list(keep_names)
-    indices = [all_names.index(name) for name in keep_names]
-    return np.array(X)[:, indices]
+    name_to_idx = {n: i for i, n in enumerate(all_names)}
+    indices = [name_to_idx[name] for name in keep_names]
+    return np.asarray(X)[:, indices]
 
 
 def _log_transform_scores(scores):
@@ -229,9 +243,12 @@ def _build_explainer(model, X_train, background_size=0.1, rng=None):
         masker    = shap.maskers.Independent(X_train)
         explainer = shap.explainers.Linear(model, masker)
         return explainer, True
+    _tree_errors = [TypeError, ValueError, AttributeError, ImportError]
+    if hasattr(shap.utils, 'InvalidModelError'):
+        _tree_errors.append(shap.utils.InvalidModelError)
     try:
         return shap.TreeExplainer(model), False
-    except Exception:
+    except tuple(_tree_errors):
         pass
     X_arr = np.array(X_train)
     if len(X_arr) < 500:
@@ -401,7 +418,7 @@ def _compute_criterion(model_factory, X, y, feature_names,
     :return: (score, log_lik, k_effective, n_samples)  — higher score = better
     """
     from sklearn.metrics import log_loss
-    from scipy.special import comb
+    from scipy.special import gammaln
 
     model_factory = _coerce_factory(model_factory)
     n     = len(y)
@@ -449,7 +466,11 @@ def _compute_criterion(model_factory, X, y, feature_names,
     if criterion == 'llf':
         return log_lik, log_lik, k, n
 
-    log_comb = float(np.log(max(comb(p_total, k, exact=True), 1)))
+    # log C(p_total, k) via gammaln — avoids integer overflow for large p_total
+    log_comb = float(
+        gammaln(p_total + 1) - gammaln(k + 1) - gammaln(p_total - k + 1)
+    )
+    log_comb = max(log_comb, 0.0)  # guard against floating-point noise near 0
 
     if criterion == 'ebic':
         bic_pen = k * np.log(n) - 2.0 * log_lik
@@ -457,7 +478,7 @@ def _compute_criterion(model_factory, X, y, feature_names,
 
     if criterion == 'rebic':
         if task == 'regression':
-            rss0  = float(np.linalg.norm(y, ord=2) ** 2) / n
+            rss0  = max(float(np.sum((y - np.mean(y)) ** 2)), 1e-10) / n
             rebic = (n * np.log(rss / n)
                      + k * np.log(n / (2.0 * np.pi))
                      + (k + 2) * np.log(rss0 / rss)
@@ -562,7 +583,7 @@ def keep_absolute(model_factory, X, y, feature_names, ordered_feature_names,
     else:
         effective_cv = cv if cv is not None else 3
 
-    X_arr       = np.array(X)
+    X_arr       = np.asarray(X)
     mean_scores = []
     std_scores  = []
 
@@ -1080,13 +1101,14 @@ def auto_select(
     if crit_name is not None:
         # Split mode: scores are on different scales.  Evaluate criterion
         # in-sample on both selected subsets and compare those IC values.
+        X_arr = np.asarray(X)
         abs_crit_score, _, _, _ = _compute_criterion(
-            model_factory, np.array(X), y, feature_names,
+            model_factory, X_arr, y, feature_names,
             abs_result['selected_features'],
             task, crit_name, crit_gamma,
         )
         knee_crit_score, _, _, _ = _compute_criterion(
-            model_factory, np.array(X), y, feature_names,
+            model_factory, X_arr, y, feature_names,
             knee_result['selected_features'],
             task, crit_name, crit_gamma,
         )
@@ -1098,12 +1120,12 @@ def auto_select(
         winner = 'absolute' if abs_score >= knee_score else 'knee'
 
     out = {
-        'selected_features': (abs_result if winner == 'absolute' else knee_result)['selected_features'],
+        'selected_features': list((abs_result if winner == 'absolute' else knee_result)['selected_features']),
         'winner':            winner,
         'scoring':           scoring,
         'criterion':         criterion,
-        'absolute_features': np.array(list(abs_result['selected_features'])),
-        'knee_features':     np.array(list(knee_result['selected_features'])),
+        'absolute_features': list(abs_result['selected_features']),
+        'knee_features':     list(knee_result['selected_features']),
         'absolute_score':    abs_score,
         'knee_score':        knee_score,
         'absolute_result':   abs_result,
@@ -1175,10 +1197,11 @@ def apply_feature_selection(X, all_feature_names, selected_feature_names):
     except ImportError:
         pass
     try:
-        indices = [all_feature_names.index(name) for name in selected_feature_names]
-    except ValueError as e:
+        name_to_idx = {n: i for i, n in enumerate(all_feature_names)}
+        indices = [name_to_idx[name] for name in selected_feature_names]
+    except KeyError as e:
         raise ValueError(
             f"Feature not found: {e}.  "
             "Check selected_feature_names is a subset of all_feature_names."
         ) from e
-    return np.array(X)[:, indices]
+    return np.asarray(X)[:, indices]

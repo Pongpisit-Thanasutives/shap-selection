@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shap-selection"
-version = "1.0.1"
+version = "1.0.2"
 description = "Feature selection via SHAP values, based on Marcilio-Jr & Eler (SIBGRAPI 2020)"
 readme = "README.md"
 license = { text = "MIT" }
@@ -34,7 +34,7 @@ dev = [
 ]
 
 [project.urls]
-Repository = "https://github.com/your-username/shap-selection"
+Repository = "https://github.com/pongpisit-thanasutives/shap-selection"
 
 [tool.setuptools.packages.find]
 where = ["src"]

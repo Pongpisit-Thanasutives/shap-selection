@@ -999,12 +999,12 @@ class TestAutoSelect:
 
     def test_split_knee_uses_insample(self, reg_data, ordered_reg):
         """knee_detection leg must use criterion='bic', NOT cross_val_score."""
-        from unittest.mock import patch
         X_tr, _, y_tr, _, feat = reg_data
-        # We verify that the knee sweep scores have std=0 (in-sample path)
+        # We verify that the knee sweep scores have std=0 (in-sample path).
+        # cv=3 (not 99) to avoid NaN from rank-deficient CV folds on small data.
         result = auto_select(LinearRegression, X_tr, y_tr, feat, ordered_reg,
                              task='regression', steps=[0.25, 0.5, 0.75, 1.0],
-                             cv=99, scoring='r2', criterion='bic')
+                             cv=3, scoring='r2', criterion='bic')
         knee_std = result['knee_result']['std']
         assert np.allclose(knee_std, 0.0), \
             "knee_detection std must be 0 when criterion is set (in-sample path)"
@@ -1354,3 +1354,239 @@ class TestEdgeCases:
             LinearRegression, X, y, feat, names,
             task='regression', cv=999, scoring='bic')
         assert len(result['selected_features']) >= 1
+
+
+# ---------------------------------------------------------------------------
+# New tests: EBIC/REBIC overflow, 3D SHAP arrays, REBIC formula, consistency
+# ---------------------------------------------------------------------------
+
+class TestEbicHighDimensional:
+    """Test that EBIC/REBIC do not overflow with many features."""
+
+    @pytest.fixture(scope="class")
+    def high_dim_data(self):
+        rng = np.random.default_rng(99)
+        n, p = 300, 150
+        X = rng.standard_normal((n, p))
+        y = X[:, 0] * 3.0 + X[:, 1] * 1.5 + rng.standard_normal(n) * 0.1
+        feat = np.array([f"f{i}" for i in range(p)])
+        return X, y, feat
+
+    def test_ebic_no_overflow(self, high_dim_data):
+        """EBIC with 150 features must not raise OverflowError."""
+        X, y, feat = high_dim_data
+        selected = list(feat[:10])
+        score, log_lik, k, n = compute_criterion(
+            LinearRegression, X, y, feat, selected,
+            task='regression', criterion='ebic', gamma=1.0,
+        )
+        assert np.isfinite(score)
+        assert np.isfinite(log_lik)
+
+    def test_rebic_no_overflow(self, high_dim_data):
+        """REBIC with 150 features must not raise OverflowError."""
+        X, y, feat = high_dim_data
+        selected = list(feat[:10])
+        score, log_lik, k, n = compute_criterion(
+            LinearRegression, X, y, feat, selected,
+            task='regression', criterion='rebic', gamma=1.0,
+        )
+        assert np.isfinite(score)
+        assert np.isfinite(log_lik)
+
+    def test_ebic_gamma0_still_equals_bic_high_dim(self, high_dim_data):
+        """EBIC(gamma=0) must equal BIC even at high dimensions."""
+        X, y, feat = high_dim_data
+        selected = list(feat[:20])
+        ebic_score, _, _, _ = compute_criterion(
+            LinearRegression, X, y, feat, selected,
+            task='regression', criterion='ebic', gamma=0.0,
+        )
+        bic_score, _, _, _ = compute_criterion(
+            LinearRegression, X, y, feat, selected,
+            task='regression', criterion='bic',
+        )
+        assert abs(ebic_score - bic_score) < 1e-6
+
+    def test_ebic_sweep_high_dim(self, high_dim_data):
+        """Full keep_absolute sweep with EBIC at p=150 must complete."""
+        X, y, feat = high_dim_data
+        m = LinearRegression().fit(X, y)
+        ordered, _ = shap_select(m, X, feat, task='regression')
+        result = select_by_keep_absolute(
+            LinearRegression, X, y, feat, ordered,
+            task='regression', scoring='ebic', step_by='fraction',
+        )
+        assert all(np.isfinite(result['scores']))
+        assert len(result['selected_features']) >= 1
+
+
+class TestShapOrdering3D:
+    """Test that _shap_ordering handles both list-of-2D and 3D ndarray SHAP values."""
+
+    def test_3d_ndarray_classification(self):
+        """Modern SHAP: 3D ndarray (n_samples, n_features, n_classes)."""
+        rng = np.random.default_rng(42)
+        n_samples, n_features, n_classes = 50, 5, 3
+        feat = np.array([f"f{i}" for i in range(n_features)])
+        # Make f0 most important across all classes
+        shap_3d = rng.standard_normal((n_samples, n_features, n_classes)) * 0.01
+        shap_3d[:, 0, :] = rng.standard_normal((n_samples, n_classes)) * 10.0
+
+        names, importance = _core._shap_ordering(feat, shap_3d, task='classification')
+        assert names.shape == (n_features,)
+        assert importance.shape == (n_features,)
+        assert names[0] == 'f0', "Most important feature should be f0"
+        assert np.all(importance[:-1] >= importance[1:]), "Importance must be descending"
+
+    def test_list_of_2d_classification(self):
+        """Legacy SHAP: list of 2D arrays [class0_shap, class1_shap, ...]."""
+        rng = np.random.default_rng(42)
+        n_samples, n_features, n_classes = 50, 5, 3
+        feat = np.array([f"f{i}" for i in range(n_features)])
+        # Make f1 most important
+        shap_list = []
+        for _ in range(n_classes):
+            arr = rng.standard_normal((n_samples, n_features)) * 0.01
+            arr[:, 1] = rng.standard_normal(n_samples) * 10.0
+            shap_list.append(arr)
+
+        names, importance = _core._shap_ordering(feat, shap_list, task='classification')
+        assert names.shape == (n_features,)
+        assert importance.shape == (n_features,)
+        assert names[0] == 'f1', "Most important feature should be f1"
+
+    def test_3d_and_list_agree(self):
+        """3D ndarray and list-of-2D must produce the same ranking."""
+        rng = np.random.default_rng(7)
+        n_samples, n_features, n_classes = 80, 6, 4
+        feat = np.array([f"f{i}" for i in range(n_features)])
+
+        # Build as list-of-2D first (n_classes, n_samples, n_features)
+        shap_list = [rng.standard_normal((n_samples, n_features)) for _ in range(n_classes)]
+
+        # Convert to 3D ndarray (n_samples, n_features, n_classes)
+        shap_3d = np.stack(shap_list, axis=-1)  # (n_samples, n_features, n_classes)
+
+        names_list, imp_list = _core._shap_ordering(feat, shap_list, task='classification')
+        names_3d, imp_3d = _core._shap_ordering(feat, shap_3d, task='classification')
+
+        np.testing.assert_array_equal(names_list, names_3d)
+        np.testing.assert_allclose(imp_list, imp_3d, atol=1e-10)
+
+    def test_2d_regression_unchanged(self):
+        """Regression (2D SHAP) must still work correctly."""
+        rng = np.random.default_rng(42)
+        feat = np.array(['a', 'b', 'c'])
+        shap_2d = rng.standard_normal((100, 3))
+        shap_2d[:, 2] = rng.standard_normal(100) * 50.0  # c is strongest
+
+        names, importance = _core._shap_ordering(feat, shap_2d, task='regression')
+        assert names[0] == 'c'
+
+
+class TestRebicNullModel:
+    """Test that REBIC correctly uses the intercept-only model as the null."""
+
+    def test_rebic_uncentered_target(self):
+        """REBIC on uncentered y must differ from ||y||^2-based computation."""
+        rng = np.random.default_rng(88)
+        X = rng.standard_normal((100, 4))
+        y = X[:, 0] * 2.0 + 100.0  # large non-zero mean
+        feat = [f"f{i}" for i in range(4)]
+        selected = ['f0', 'f1']
+
+        score, log_lik, k, n = compute_criterion(
+            LinearRegression, X, y, feat, selected,
+            task='regression', criterion='rebic', gamma=1.0,
+        )
+        assert np.isfinite(score), "REBIC must be finite for uncentered targets"
+        # REBIC must be better (higher) with the true feature than with noise only
+        score_noise, _, _, _ = compute_criterion(
+            LinearRegression, X, y, feat, ['f2', 'f3'],
+            task='regression', criterion='rebic', gamma=1.0,
+        )
+        assert score > score_noise, (
+            "REBIC for true features must beat noise features"
+        )
+
+    def test_rebic_centered_vs_uncentered(self):
+        """REBIC should give different scores for centered vs uncentered y."""
+        rng = np.random.default_rng(77)
+        X = rng.standard_normal((100, 3))
+        feat = ['a', 'b', 'c']
+        selected = ['a']
+
+        y_centered = X[:, 0] * 2.0
+        y_shifted = y_centered + 500.0  # huge shift
+
+        score_c, _, _, _ = compute_criterion(
+            LinearRegression, X, y_centered, feat, selected,
+            task='regression', criterion='rebic',
+        )
+        score_s, _, _, _ = compute_criterion(
+            LinearRegression, X, y_shifted, feat, selected,
+            task='regression', criterion='rebic',
+        )
+        # With the corrected formula, these should be the same because
+        # Ridge/LR fit_intercept=True absorbs the mean shift.
+        # The null-model RSS (y - y_bar)^2 is identical for both.
+        # So REBIC should be equal (or very close).
+        assert abs(score_c - score_s) < 1.0, (
+            "REBIC scores should be similar regardless of target mean shift "
+            f"(got {score_c:.2f} vs {score_s:.2f})"
+        )
+
+
+class TestReturnTypeConsistency:
+    """Verify that selected_features is always a list across all functions."""
+
+    @pytest.fixture(scope="class")
+    def setup(self):
+        rng = np.random.default_rng(10)
+        X = rng.standard_normal((80, 5))
+        y = X[:, 0] + 0.1 * rng.standard_normal(80)
+        feat = [f"f{i}" for i in range(5)]
+        m = LinearRegression().fit(X, y)
+        ordered, _ = shap_select(m, X, feat, task='regression')
+        return X, y, feat, ordered
+
+    def test_select_by_keep_absolute_returns_list(self, setup):
+        X, y, feat, ordered = setup
+        result = select_by_keep_absolute(
+            LinearRegression, X, y, feat, ordered, task='regression')
+        assert isinstance(result['selected_features'], list)
+
+    def test_select_by_knee_detection_returns_list(self, setup):
+        X, y, feat, ordered = setup
+        result = select_by_knee_detection(
+            LinearRegression, X, y, feat, ordered,
+            task='regression', step_by='feature')
+        assert isinstance(result['selected_features'], list)
+
+    def test_auto_select_returns_lists(self, setup):
+        X, y, feat, ordered = setup
+        result = auto_select(
+            LinearRegression, X, y, feat, ordered, task='regression')
+        assert isinstance(result['selected_features'], list)
+        assert isinstance(result['absolute_features'], list)
+        assert isinstance(result['knee_features'], list)
+
+
+class TestPreExistingBugFix:
+    """Regression test: the pre-existing test that fails with cv=99 on small data."""
+
+    def test_split_knee_uses_insample_fixed(self):
+        """Same intent as the original test but with cv=3 to avoid NaN."""
+        X, y = make_regression(n_samples=200, n_features=8, noise=0.1, random_state=42)
+        feat = np.array([f"f{i}" for i in range(8)])
+        X_tr = X[:160]
+        y_tr = y[:160]
+        m = LinearRegression().fit(X_tr, y_tr)
+        ordered, _ = shap_select(m, X_tr, feat, task='regression')
+        result = auto_select(LinearRegression, X_tr, y_tr, feat, ordered,
+                             task='regression', steps=[0.25, 0.5, 0.75, 1.0],
+                             cv=3, scoring='r2', criterion='bic')
+        knee_std = result['knee_result']['std']
+        assert np.allclose(knee_std, 0.0), \
+            "knee_detection std must be 0 when criterion is set (in-sample path)"

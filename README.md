@@ -1,6 +1,6 @@
 # shap-selection
 
-**Version 1.0.1**
+**Version 1.0.2**
 
 Feature selection for machine learning models using SHAP values, based on:
 
@@ -11,7 +11,7 @@ Feature selection for machine learning models using SHAP values, based on:
 ## Installation
 
 ```bash
-git clone https://github.com/your-username/shap-selection.git
+git clone https://github.com/pongpisit-thanasutives/shap-selection.git
 cd shap-selection
 pip install .
 ```
@@ -493,6 +493,25 @@ Split mode only (`criterion` is not `None`):
 
 ---
 
+## Changelog
+
+### 1.0.2
+
+**Bug fixes:**
+
+- **EBIC/REBIC overflow** — `comb(p, k, exact=True)` crashed with `OverflowError` or `TypeError` for datasets with ~100+ features. Replaced with `scipy.special.gammaln` for an overflow-safe log-binomial computation.
+- **Multiclass SHAP handling** — Modern SHAP (≥ 0.42) returns a 3D ndarray `(n_samples, n_features, n_classes)` for multiclass classification. The old code only handled the legacy list-of-2D format, silently producing wrong feature rankings for 3D arrays.
+- **REBIC null-model RSS** — The intercept-only residual sum of squares used `‖y‖²` instead of `‖y − ȳ‖²`, giving incorrect REBIC scores when the target had a non-zero mean.
+
+**Improvements:**
+
+- Narrowed the bare `except Exception` in `_build_explainer` to specific error types.
+- `_select_columns` and `apply_feature_selection` now use O(1) dict lookups instead of O(n) linear scans.
+- Replaced `np.array(X)` with `np.asarray(X)` throughout to avoid unnecessary copies when X is already an ndarray.
+- `selected_features`, `absolute_features`, and `knee_features` in result dicts are now consistently Python lists across all functions.
+
+---
+
 ## Citation
 
 If you use this library in research, please cite the original paper and this repository.
@@ -518,8 +537,8 @@ If you use this library in research, please cite the original paper and this rep
   title   = {shap-selection: Feature selection via SHAP values},
   author  = {Thanasutives, Pongpisit},
   year    = {2025},
-  url     = {https://github.com/your-username/shap-selection},
-  version = {1.0.1}
+  url     = {https://github.com/pongpisit-thanasutives/shap-selection},
+  version = {1.0.2}
 }
 ```
 
